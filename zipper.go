@@ -104,12 +104,10 @@ func getFilesFromRedis(token string) (files []*RedisFile, err error) {
     // Get the value from Redis
     result, err := redis.Do("GET", "zip:" + token)
     if err != nil {
-        panic(err)
         return
     }
 
     if (result == nil) {
-        panic(result)
         return
     }
 
@@ -123,7 +121,6 @@ func getFilesFromRedis(token string) (files []*RedisFile, err error) {
     // Decode JSON
     err = json.Unmarshal(resultByte, &files)
     if err != nil {
-        panic("003")
         return
     }
 
@@ -158,7 +155,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
     files, err := getFilesFromRedis(token)
 
     if err != nil {
-        panic("002")
         return
     }
 
