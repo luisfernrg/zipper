@@ -1,0 +1,28 @@
+{
+	"ImportPath": "codecourse/zipper",
+	"GoVersion": "go1.7",
+	"GodepVersion": "v74",
+	"Packages": [
+		"./..."
+	],
+	"Deps": [
+		{
+			"ImportPath": "github.com/AdRoll/goamz/aws",
+			"Rev": "fa22f27f1215976225fd533ba4050d87f1b4d5f4"
+		},
+		{
+			"ImportPath": "github.com/AdRoll/goamz/s3",
+			"Rev": "fa22f27f1215976225fd533ba4050d87f1b4d5f4"
+		},
+		{
+			"ImportPath": "github.com/garyburd/redigo/internal",
+			"Comment": "v1.0.0-5-gffa8d46",
+			"Rev": "ffa8d46ada782d81cfda81a0fbd9f45ceae448e8"
+		},
+		{
+			"ImportPath": "github.com/garyburd/redigo/redis",
+			"Comment": "v1.0.0-5-gffa8d46",
+			"Rev": "ffa8d46ada782d81cfda81a0fbd9f45ceae448e8"
+		}
+	]
+}
