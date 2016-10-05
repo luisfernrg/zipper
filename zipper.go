@@ -17,6 +17,8 @@ import (
 	"github.com/goamz/goamz/s3"
 )
 
+// config contains everything which
+// will be set in .env
 type config struct {
 	awsAccessKey  string
 	awsSecretKey  string
@@ -28,12 +30,16 @@ type config struct {
 	srvPort       string
 }
 
+// server is used to do dependency injection so
+// handler will have access to redis pool aws bucket
+// and compiled regex instead of global state
 type server struct {
 	pool         *redis.Pool
 	bucket       *s3.Bucket
 	safeFileName *regexp.Regexp
 }
 
+// structure for data stored in redis
 type redisFile struct {
 	S3Path   string
 	FileName string
@@ -73,6 +79,7 @@ func main() {
 	http.ListenAndServe(":"+cfg.srvPort, nil)
 }
 
+// init and auth for s3 bucket
 func initS3Bucket(cfg config) (*s3.Bucket, error) {
 	exp := time.Now().Add(time.Hour)
 	auth, err := aws.GetAuth(cfg.awsAccessKey, cfg.awsSecretKey, "", exp)
@@ -88,6 +95,7 @@ func initS3Bucket(cfg config) (*s3.Bucket, error) {
 	return s3.New(auth, rgn, aws.RetryingClient).Bucket(cfg.awsBucket), nil
 }
 
+// init and auth for redis pool
 func initRedisPool(cfg config) *redis.Pool {
 	pool := &redis.Pool{
 		Dial: func() (redis.Conn, error) {
@@ -111,6 +119,8 @@ func initRedisPool(cfg config) *redis.Pool {
 	return pool
 }
 
+// handler is a method on server struct so it can have
+// access to dependencies
 func (srv *server) handler(w http.ResponseWriter, r *http.Request) {
 	strt := time.Now()
 
@@ -198,6 +208,8 @@ func (srv *server) handler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("%s\t%s\t%s", r.Method, r.RequestURI, time.Since(strt))
 }
 
+// gets data from redis and json decodes it into a
+// slice of redisFile(s)
 func getRedisFiles(tkn string, pool *redis.Pool) ([]redisFile, error) {
 	conn := pool.Get()
 	defer conn.Close()
