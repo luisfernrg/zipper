@@ -1,221 +1,226 @@
 package main
 
 import (
-    "archive/zip"
-    "encoding/json"
-    "fmt"
-    "io"
-    "log"
-    "os"
-    "regexp"
-    "strings"
-    "time"
+	"archive/zip"
+	"encoding/json"
+	"errors"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"regexp"
+	"strings"
+	"time"
 
-    "net/http"
-
-    "github.com/AdRoll/goamz/aws"
-    "github.com/AdRoll/goamz/s3"
-    redigo "github.com/garyburd/redigo/redis"
+	"github.com/garyburd/redigo/redis"
+	"github.com/goamz/goamz/aws"
+	"github.com/goamz/goamz/s3"
 )
 
-type Configuration struct {
-    AccessKey          string 
-    SecretKey          string 
-    Bucket             string 
-    Region             string
-    RedisServer        string
-    RedisPort          string
-    RedisPassword      string
+type config struct {
+	awsAccessKey  string
+	awsSecretKey  string
+	awsBucket     string
+	awsRegion     string
+	redisServer   string
+	redisPort     string
+	redisPassword string
+	srvPort       string
 }
 
-var config = Configuration {
-    AccessKey: os.Getenv("S3_KEY"),
-    SecretKey: os.Getenv("S3_SECRET"),
-    Bucket: os.Getenv("S3_BUCKET"),
-    Region: os.Getenv("S3_REGION"),
-    RedisServer: os.Getenv("REDIS_HOST"),
-    RedisPort: os.Getenv("REDIS_PORT"),
-    RedisPassword: os.Getenv("REDIS_PASSWORD"),
+type server struct {
+	pool         *redis.Pool
+	bucket       *s3.Bucket
+	safeFileName *regexp.Regexp
 }
 
-var aws_bucket *s3.Bucket
-var redisPool *redigo.Pool
-
-type RedisFile struct {
-    FileName string
-    Folder   string
-    S3Path   string
+type redisFile struct {
+	S3Path   string
+	FileName string
+	Folder   string
 }
 
 func main() {
-    initAwsBucket()
-    InitRedis()
+	cfg := config{
+		awsAccessKey:  os.Getenv("S3_KEY"),
+		awsSecretKey:  os.Getenv("S3_SECRET"),
+		awsBucket:     os.Getenv("S3_BUCKET"),
+		awsRegion:     os.Getenv("S3_REGION"),
+		redisServer:   os.Getenv("REDIS_HOST"),
+		redisPort:     os.Getenv("REDIS_PORT"),
+		redisPassword: os.Getenv("REDIS_PASSWORD"),
+		srvPort:       os.Getenv("PORT"),
+	}
 
-    fmt.Println("Running on port", os.Getenv("PORT"))
-    http.HandleFunc("/", handler)
-    http.ListenAndServe(":" + os.Getenv("PORT"), nil)
+	pool := initRedisPool(cfg)
+
+	bkt, err := initS3Bucket(cfg)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	srv := &server{
+		pool:         pool,
+		bucket:       bkt,
+		safeFileName: regexp.MustCompile(`[#<>:"/\|?*\\]`),
+	}
+
+	http.HandleFunc("/", srv.handler)
+
+	if cfg.srvPort == "" {
+		cfg.srvPort = "8080"
+	}
+	http.ListenAndServe(":"+cfg.srvPort, nil)
 }
 
-func initAwsBucket() {
-    expiration := time.Now().Add(time.Hour * 1)
-    auth, err := aws.GetAuth(config.AccessKey, config.SecretKey, "", expiration)
+func initS3Bucket(cfg config) (*s3.Bucket, error) {
+	exp := time.Now().Add(time.Hour)
+	auth, err := aws.GetAuth(cfg.awsAccessKey, cfg.awsSecretKey, "", exp)
+	if err != nil {
+		return nil, err
+	}
 
-    if err != nil {
-        panic(err)
-    }
+	rgn, ok := aws.Regions[cfg.awsRegion]
+	if !ok {
+		return nil, errors.New("Region not found")
+	}
 
-    aws_bucket = s3.New(auth, aws.GetRegion(config.Region)).Bucket(config.Bucket)
+	return s3.New(auth, rgn, aws.RetryingClient).Bucket(cfg.awsBucket), nil
 }
 
-func InitRedis() {
-    redisPool = &redigo.Pool{
-        MaxIdle:     10,
-        IdleTimeout: 1 * time.Second,
-        Dial: func() (redigo.Conn, error) {
-            c, err := redigo.Dial("tcp", strings.Join([] string {config.RedisServer, ":", config.RedisPort}, ""))
-
-            if err != nil {
-                return nil, err
-            }
-
-            if _, err := c.Do("AUTH", config.RedisPassword); err != nil {
-                c.Close()
-                return nil, err
-            }
-
-            return c, err
-        },
-        TestOnBorrow: func(c redigo.Conn, t time.Time) (err error) {
-            if err != nil {
-                panic("Error connecting to redis")
-            }
-            return
-        },
-    }
+func initRedisPool(cfg config) *redis.Pool {
+	pool := &redis.Pool{
+		Dial: func() (redis.Conn, error) {
+			c, err := redis.Dial("tcp", cfg.redisServer+":"+cfg.redisPort)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := c.Do("AUTH", cfg.redisPassword); err != nil {
+				c.Close()
+				return nil, err
+			}
+			return c, err
+		},
+		MaxIdle:     10,
+		IdleTimeout: 1 * time.Second,
+		TestOnBorrow: func(c redis.Conn, t time.Time) error {
+			_, err := c.Do("PING")
+			return err
+		},
+	}
+	return pool
 }
 
-// Remove all other unrecognised characters apart from
-var makeSafeFileName = regexp.MustCompile(`[#<>:"/\|?*\\]`)
+func (srv *server) handler(w http.ResponseWriter, r *http.Request) {
+	strt := time.Now()
 
-func getFilesFromRedis(token string) (files []*RedisFile, err error) {
-    redis := redisPool.Get()
-    defer redis.Close()
+	qry := r.URL.Query()
+	if len(qry) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 
-    // Get the value from Redis
-    result, err := redis.Do("GET", "zip:" + token)
-    if err != nil {
-        return
-    }
+	token, ok := qry["token"]
+	if !ok || len(token[0]) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 
-    if (result == nil) {
-        return
-    }
+	as, ok := qry["as"]
+	if !ok {
+		as = append(as, "download.zip")
+	}
+	if ok {
+		as[0] = srv.safeFileName.ReplaceAllString(as[0], "")
+	}
+	if len(as[0]) == 0 {
+		as[0] = "download.zip"
+	}
 
-    // Convert to bytes
-    var resultByte []byte
-    var ok bool
-    if resultByte, ok = result.([]byte); !ok {
-        return
-    }
+	files, err := getRedisFiles(token[0], srv.pool)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
 
-    // Decode JSON
-    err = json.Unmarshal(resultByte, &files)
-    if err != nil {
-        return
-    }
+	w.Header().Add("Content-Disposition", "attachment; filename=\""+as[0]+"\"")
+	w.Header().Add("Content-Type", "application/zip")
 
-    return
+	zw := zip.NewWriter(w)
+	defer zw.Close()
+	for _, file := range files {
+		if file.S3Path == "" {
+			log.Printf("Missing path for file: %v", file)
+			continue
+		}
+
+		safeFileName := srv.safeFileName.ReplaceAllString(file.FileName, "")
+
+		if safeFileName == "" {
+			safeFileName = "file"
+		}
+
+		rdr, err := srv.bucket.GetReader(file.S3Path)
+		if err != nil {
+			switch t := err.(type) {
+			case *s3.Error:
+				if t.StatusCode == 404 {
+					log.Printf("File not found. %s", file.S3Path)
+				}
+			default:
+				log.Printf("Error downloading \"%s\" - %s", file.S3Path, err.Error())
+			}
+			continue
+		}
+
+		zipPath := ""
+
+		if file.Folder != "" {
+			zipPath += file.Folder
+			if !strings.HasSuffix(zipPath, "/") {
+				zipPath += "/"
+			}
+		}
+
+		zipPath += safeFileName
+
+		h := &zip.FileHeader{
+			Name:   zipPath,
+			Method: zip.Deflate,
+		}
+
+		f, _ := zw.CreateHeader(h)
+
+		io.Copy(f, rdr)
+		rdr.Close()
+	}
+
+	log.Printf("%s\t%s\t%s", r.Method, r.RequestURI, time.Since(strt))
 }
 
-func handler(w http.ResponseWriter, r *http.Request) {
-    start := time.Now()
+func getRedisFiles(tkn string, pool *redis.Pool) ([]redisFile, error) {
+	conn := pool.Get()
+	defer conn.Close()
 
-    // Get "token" URL params
-    tokens, ok := r.URL.Query()["token"]
+	rply, err := conn.Do("GET", "zip:"+tkn)
+	if err != nil {
+		return nil, err
+	}
+	if rply == nil {
+		return nil, errors.New("No files found")
+	}
 
-    if !ok || len(tokens) < 1 {
-        http.Error(w, "", 500)
-        return
-    }
+	var (
+		b  []byte
+		ok bool
+	)
+	if b, ok = rply.([]byte); !ok {
+		return nil, errors.New("Assertion failed")
+	}
 
-    token := tokens[0]
-
-    // Get 'as' parameter
-    downloadAs, ok := r.URL.Query()["as"]
-
-    if !ok && len(downloadAs) > 0 {
-        downloadAs[0] = makeSafeFileName.ReplaceAllString(downloadAs[0], "")
-        if downloadAs[0] == "" {
-            downloadAs[0] = "download.zip"
-        }
-    } else {
-        downloadAs = append(downloadAs, "download.zip")
-    }
-
-    files, err := getFilesFromRedis(token)
-
-    if err != nil {
-        return
-    }
-
-    // Start processing the response
-    w.Header().Add("Content-Disposition", "attachment; filename=\""+downloadAs[0]+"\"")
-    w.Header().Add("Content-Type", "application/zip")
-
-    // Loop over files, add them to the zip
-    zipWriter := zip.NewWriter(w)
-    for _, file := range files {
-        if file.S3Path == "" {
-            log.Printf("Missing path for file: %v", file)
-            continue
-        }
-
-        // Build safe file file name
-        safeFileName := makeSafeFileName.ReplaceAllString(file.FileName, "")
-
-        if safeFileName == "" { // Unlikely but just in case
-            safeFileName = "file"
-        }
-
-        // Read file from S3, log any errors
-        rdr, err := aws_bucket.GetReader(file.S3Path)
-        if err != nil {
-            switch t := err.(type) {
-            case *s3.Error:
-                if t.StatusCode == 404 {
-                    log.Printf("File not found. %s", file.S3Path)
-                }
-            default:
-                log.Printf("Error downloading \"%s\" - %s", file.S3Path, err.Error())
-            }
-            continue
-        }
-
-        // Build a good path for the file within the zip
-        zipPath := ""
-
-        // Prefix folder name, if any
-        if file.Folder != "" {
-            zipPath += file.Folder
-            if !strings.HasSuffix(zipPath, "/") {
-                zipPath += "/"
-            }
-        }
-
-        zipPath += safeFileName
-
-        h := &zip.FileHeader {
-            Name:   zipPath,
-            Method: zip.Deflate,
-        }
-
-        f, _ := zipWriter.CreateHeader(h)
-
-        io.Copy(f, rdr)
-        rdr.Close()
-    }
-
-    zipWriter.Close()
-
-    log.Printf("%s\t%s\t%s", r.Method, r.RequestURI, time.Since(start))
+	var files []redisFile
+	if err := json.Unmarshal(b, &files); err != nil {
+		return nil, err
+	}
+	return files, nil
 }
